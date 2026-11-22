@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { JSDOM } from "jsdom";
 import type { ChatMessageDTO, SpindleFrontendContext } from "lumiverse-spindle-types";
 import { setup, teardown } from "../src/frontend.js";
+import { MMP_STYLES } from "../src/frontend/styles.js";
 import {
   type BackendToFrontendMessage,
   type ChatMetaMap,
@@ -751,6 +752,24 @@ describe("Message Meta Plus Frontend Host Integration", () => {
         expect(allWrappers).toHaveLength(1);
       }
     }
+
+    // Footer layout-shift guard: verify .mmp-inj-wrap--footer is out-of-flow (position: absolute; padding: 0; margin: 0; width: auto)
+    const footerBubbleBlock = MMP_STYLES.match(
+      /\.mmp-inj-wrap--footer\.mmp-inj-wrap--bubble\s*\{([^}]+)\}/,
+    )?.[1];
+    const footerMinimalBlock = MMP_STYLES.match(
+      /\.mmp-inj-wrap--footer\.mmp-inj-wrap--minimal\s*\{([^}]+)\}/,
+    )?.[1];
+    expect(footerBubbleBlock).toBeDefined();
+    expect(footerMinimalBlock).toBeDefined();
+    for (const block of [footerBubbleBlock!, footerMinimalBlock!]) {
+      expect(block).toContain("position: absolute;");
+      expect(block).toContain("width: auto;");
+      expect(block).toContain("padding: 0;");
+      expect(block).toContain("margin: 0;");
+      expect(block).not.toContain("width: 100%;");
+    }
+    expect(MMP_STYLES).not.toContain("padding: 0 24px 14px;");
   });
 
   test("tears down cleanly and re-setups without duplicate listeners or pills", () => {
