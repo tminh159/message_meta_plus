@@ -34,6 +34,7 @@ interface PillLayoutMeta {
   position: PillPosition;
   variant: MessageVariant;
   rowReverse: boolean;
+  isUser: boolean;
 }
 
 const MESSAGE_HEADER_SELECTOR = '[data-spindle-mount="message_header"]';
@@ -154,6 +155,7 @@ function computePillSignature(
     position: layout.position,
     variant: layout.variant,
     rowReverse: layout.rowReverse,
+    isUser: layout.isUser,
     mode: view.mode,
     inlineSegments: view.inlineSegments,
     tooltipRows: view.tooltipRows,
@@ -171,6 +173,7 @@ function buildPillHtml(
   const layoutClasses = [
     `mmp-pill--pos-${layout.position}`,
     `mmp-pill--${layout.variant}`,
+    ...(layout.isUser ? ["mmp-pill--user"] : []),
     ...(layout.rowReverse ? ["mmp-pill--row-reverse"] : []),
   ].join(" ");
   const dataAttrs = `data-mmp-pill="1" data-mmp-msg-id="${safeId}" data-mmp-swipe-id="${safeSwipe}" data-mmp-pos="${layout.position}" data-mmp-variant="${layout.variant}"`;
@@ -198,6 +201,9 @@ function applyWrapperClasses(wrapper: Element, layout: PillLayoutMeta): void {
     `mmp-inj-wrap--${layout.position}`,
     `mmp-inj-wrap--${layout.variant}`,
   );
+  if (layout.isUser) {
+    wrapper.classList.add("mmp-inj-wrap--user");
+  }
   if (layout.rowReverse) {
     wrapper.classList.add("mmp-inj-wrap--row-reverse");
   }
@@ -492,6 +498,7 @@ export function setup(ctx: SpindleFrontendContext): () => void {
       position: settings.position,
       variant,
       rowReverse,
+      isUser,
     };
 
     const signature = computePillSignature(view, messageId, swipeId, layout);

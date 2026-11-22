@@ -753,23 +753,52 @@ describe("Message Meta Plus Frontend Host Integration", () => {
       }
     }
 
-    // Footer layout-shift guard: verify .mmp-inj-wrap--footer is out-of-flow (position: absolute; padding: 0; margin: 0; width: auto)
+    // Footer layout-shift guard: AI footer aligns to lower bound of SwipeControls row; user footer stays in-flow
     const footerBubbleBlock = MMP_STYLES.match(
       /\.mmp-inj-wrap--footer\.mmp-inj-wrap--bubble\s*\{([^}]+)\}/,
     )?.[1];
     const footerMinimalBlock = MMP_STYLES.match(
       /\.mmp-inj-wrap--footer\.mmp-inj-wrap--minimal\s*\{([^}]+)\}/,
     )?.[1];
+    const footerUserBubbleBlock = MMP_STYLES.match(
+      /\.mmp-inj-wrap--footer\.mmp-inj-wrap--bubble\.mmp-inj-wrap--user\s*\{([^}]+)\}/,
+    )?.[1];
     expect(footerBubbleBlock).toBeDefined();
     expect(footerMinimalBlock).toBeDefined();
+    expect(footerUserBubbleBlock).toBeDefined();
     for (const block of [footerBubbleBlock!, footerMinimalBlock!]) {
       expect(block).toContain("position: absolute;");
+      expect(block).toContain("align-items: flex-end;");
       expect(block).toContain("width: auto;");
       expect(block).toContain("padding: 0;");
       expect(block).toContain("margin: 0;");
       expect(block).not.toContain("width: 100%;");
+      expect(block).not.toContain("min-height:");
     }
-    expect(MMP_STYLES).not.toContain("padding: 0 24px 14px;");
+    expect(footerBubbleBlock).toContain("bottom: 18px;");
+    expect(footerMinimalBlock).toContain("bottom: 12px;");
+    expect(footerUserBubbleBlock).toContain("position: static;");
+    expect(footerUserBubbleBlock).toContain("padding: 0 24px 14px;");
+    expect(MMP_STYLES).not.toContain("padding: 2px 8px;");
+    expect(MMP_STYLES).not.toContain("width: 18px;");
+
+    // Verify user bubble in footer receives mmp-inj-wrap--user / mmp-pill--user classes
+    const userFooter = host.mountMessageDom({ id: "msg-pos-u", layout: "bubble", isUser: true });
+    host.pushFromBackend({
+      type: "chat-meta-update",
+      chatId: "chat-1",
+      meta: { "msg-pos-u:0": { isUser: true, wordCount: 12 } },
+      messageStates: { "msg-pos-u": { swipeId: 0, isUser: true } },
+    });
+    const prevWordBtn = host.drawerRoot.querySelector(
+      'button[data-mmp-field="wordCount"][data-mmp-mode="inline"]',
+    ) as HTMLButtonElement;
+    prevWordBtn.click();
+    posSelect!.value = "footer";
+    posSelect!.dispatchEvent(new host.dom.window.Event("change", { bubbles: true }));
+    const userFooterPill = userFooter.querySelector("[data-mmp-pill]");
+    expect(userFooterPill?.classList.contains("mmp-pill--user")).toBe(true);
+    expect(userFooterPill?.parentElement?.classList.contains("mmp-inj-wrap--user")).toBe(true);
   });
 
   test("tears down cleanly and re-setups without duplicate listeners or pills", () => {
