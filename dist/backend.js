@@ -426,7 +426,7 @@ class BackendStore {
 
 // src/backend/controller.ts
 var MAX_COMPLETED_REFS = 500;
-var STALE_BUFFER_TTL_MS = 10 * 60 * 1000;
+var STALE_BUFFER_TTL_MS = 60 * 60 * 1000;
 function asRecord(value) {
   return value && typeof value === "object" && !Array.isArray(value) ? value : null;
 }
@@ -474,6 +474,7 @@ function createBackend(spindle2) {
   const activeBuffersByGenId = new Map;
   const completedRefsByGenId = new Map;
   const hydrationInFlight = new Map;
+  const chatMutationEpoch = new Map;
   const activeChatIdByUser = new Map;
   const lastKnownContentByChat = new Map;
   const messageStatesByChat = new Map;
@@ -531,6 +532,15 @@ function createBackend(spindle2) {
       delete states[messageId];
     }
   }
+  function getChatMutationEpoch(chatId, userId) {
+    return chatMutationEpoch.get(chatScopeKey(chatId, userId)) ?? 0;
+  }
+  function bumpChatMutationEpoch(chatId, userId) {
+    const scope = chatScopeKey(chatId, userId);
+    const next = (chatMutationEpoch.get(scope) ?? 0) + 1;
+    chatMutationEpoch.set(scope, next);
+    return next;
+  }
   function sendToFrontend(msg, userId) {
     spindle2.sendToFrontend(msg, userId);
   }
@@ -556,7 +566,7 @@ function createBackend(spindle2) {
   function pruneStaleBuffers(now = Date.now()) {
     const cutoff = now - STALE_BUFFER_TTL_MS;
     for (const [genId, buf] of activeBuffersByGenId.entries()) {
-      if (buf.startedAt < cutoff) {
+      if (buf.lastActivityAt < cutoff) {
         activeBuffersByGenId.delete(genId);
         if (activeBuffersByChat.get(buf.chatId) === buf) {
           activeBuffersByChat.delete(buf.chatId);
@@ -564,17 +574,20 @@ function createBackend(spindle2) {
       }
     }
     for (const [chatId, buf] of activeBuffersByChat.entries()) {
-      if (buf.startedAt < cutoff) {
+      if (buf.lastActivityAt < cutoff) {
         activeBuffersByChat.delete(chatId);
       }
     }
   }
   function getOrCreateBuffer(chatId, generationId) {
-    pruneStaleBuffers();
+    const now = Date.now();
+    pruneStaleBuffers(now);
     if (generationId) {
       const byId = activeBuffersByGenId.get(generationId);
-      if (byId)
+      if (byId) {
+        byId.lastActivityAt = now;
         return byId;
+      }
     }
     const existing = activeBuffersByChat.get(chatId);
     if (existing && (!generationId || !existing.generationId || existing.generationId === generationId)) {
@@ -582,12 +595,14 @@ function createBackend(spindle2) {
         existing.generationId = generationId;
         activeBuffersByGenId.set(generationId, existing);
       }
+      existing.lastActivityAt = now;
       return existing;
     }
     const created = {
       generationId,
       chatId,
-      startedAt: Date.now(),
+      startedAt: now,
+      lastActivityAt: now,
       streamedMessageIds: new Set,
       lorebookEntries: [],
       macroNames: new Set
@@ -616,6 +631,15 @@ function createBackend(spindle2) {
       }
     }
     completedRefsByGenId.set(generationId, ref);
+  }
+  function isRecentlyCompletedTarget(chatId, messageId, swipeId, windowMs = 30000) {
+    const cutoff = Date.now() - windowMs;
+    for (const ref of completedRefsByGenId.values()) {
+      if (ref.chatId === chatId && ref.messageId === messageId && ref.swipeId === swipeId && ref.completedAt >= cutoff) {
+        return true;
+      }
+    }
+    return false;
   }
   function mergeExtraIntoRecord(existing, params) {
     const next = existing ? { ...existing } : {};
@@ -646,21 +670,50 @@ function createBackend(spindle2) {
   }
   async function hydrateChat(chatId, userId) {
     const flightKey = chatScopeKey(chatId, userId);
+    const startEpoch = getChatMutationEpoch(chatId, userId);
     const existingFlight = hydrationInFlight.get(flightKey);
     if (existingFlight) {
-      return existingFlight;
-    }
-    const job = (async () => {
-      const meta = await store.loadChatMeta(chatId, userId);
-      if (!hasPermission("chat_mutation") || typeof spindle2.chat?.getMessages !== "function") {
-        return meta;
+      if (existingFlight.epoch >= startEpoch) {
+        return existingFlight.promise;
       }
+      await existingFlight.promise.catch(() => {
+        return;
+      });
+      return hydrateChat(chatId, userId);
+    }
+    const runEpoch = getChatMutationEpoch(chatId, userId);
+    const job = (async () => {
+      const initialMeta = await store.loadChatMeta(chatId, userId);
+      if (!hasPermission("chat_mutation") || typeof spindle2.chat?.getMessages !== "function") {
+        return initialMeta;
+      }
+      let meta = initialMeta;
       try {
         const messages = await spindle2.chat.getMessages(chatId);
         if (!Array.isArray(messages)) {
           return meta;
         }
+        const mutatedDuringFetch = getChatMutationEpoch(chatId, userId) !== runEpoch;
+        meta = await store.loadChatMeta(chatId, userId);
+        const activeBuf = activeBuffersByChat.get(chatId);
+        const activeProtectedIds = new Set;
+        if (activeBuf?.targetMessageId) {
+          activeProtectedIds.add(activeBuf.targetMessageId);
+        }
+        if (activeBuf) {
+          for (const id of activeBuf.streamedMessageIds) {
+            activeProtectedIds.add(id);
+          }
+        }
+        const recentlyCompletedIds = new Set;
+        const recentCutoff = Date.now() - 60000;
+        for (const ref of completedRefsByGenId.values()) {
+          if (ref.chatId === chatId && ref.completedAt >= recentCutoff) {
+            recentlyCompletedIds.add(ref.messageId);
+          }
+        }
         const liveSwipeCounts = new Map;
+        const existingStates = messageStatesByChat.get(flightKey);
         const nextStates = {};
         const contentMap = getLastKnownContentMap(chatId, userId);
         for (const rawMsg of messages) {
@@ -672,32 +725,38 @@ function createBackend(spindle2) {
           const extra = asRecord(msg.extra);
           const swipes = Array.isArray(msg.swipes) ? msg.swipes : [];
           liveSwipeCounts.set(msg.id, swipes.length > 0 ? swipes.length : activeSwipeId + 1);
-          nextStates[msg.id] = { swipeId: activeSwipeId, isUser };
+          const prevLiveState = mutatedDuringFetch ? existingStates?.[msg.id] : undefined;
+          nextStates[msg.id] = prevLiveState && meta[makeMetaKey(msg.id, prevLiveState.swipeId)] ? { swipeId: prevLiveState.swipeId, isUser: prevLiveState.isUser } : { swipeId: activeSwipeId, isUser };
           if (swipes.length > 0) {
             for (let idx = 0;idx < swipes.length; idx++) {
               const swipeText = swipes[idx];
               const content = typeof swipeText === "string" ? swipeText : idx === activeSwipeId && typeof msg.content === "string" ? msg.content : undefined;
               const key = makeMetaKey(msg.id, idx);
-              if (typeof content === "string") {
+              const existingRecord = meta[key];
+              const preserveLiveWords = mutatedDuringFetch && existingRecord?.wordCount !== undefined && existingRecord.wordCount > 0 && (!content || content.trim().length === 0);
+              if (typeof content === "string" && !preserveLiveWords) {
                 contentMap.set(key, content);
               }
               const metrics = getSwipeValue(extra?.generationMetricsBySwipe, extra?.generationMetrics, idx, activeSwipeId);
               const outcome = getSwipeValue(extra?.generationOutcomeBySwipe, extra?.generationOutcome, idx, activeSwipeId);
-              meta[key] = mergeExtraIntoRecord(meta[key], {
+              meta[key] = mergeExtraIntoRecord(existingRecord, {
                 isUser,
-                content,
+                content: preserveLiveWords ? undefined : content,
                 metrics,
                 outcome
               });
             }
           } else {
             const key = makeMetaKey(msg.id, activeSwipeId);
-            if (typeof msg.content === "string") {
-              contentMap.set(key, msg.content);
+            const rawContent = typeof msg.content === "string" ? msg.content : undefined;
+            const existingRecord = meta[key];
+            const preserveLiveWords = mutatedDuringFetch && existingRecord?.wordCount !== undefined && existingRecord.wordCount > 0 && (!rawContent || rawContent.trim().length === 0);
+            if (typeof rawContent === "string" && !preserveLiveWords) {
+              contentMap.set(key, rawContent);
             }
-            meta[key] = mergeExtraIntoRecord(meta[key], {
+            meta[key] = mergeExtraIntoRecord(existingRecord, {
               isUser,
-              content: typeof msg.content === "string" ? msg.content : undefined,
+              content: preserveLiveWords ? undefined : rawContent,
               metrics: extra?.generationMetrics,
               outcome: extra?.generationOutcome
             });
@@ -707,8 +766,10 @@ function createBackend(spindle2) {
           const parsed = parseMetaKey(key);
           if (!parsed)
             continue;
+          if (activeProtectedIds.has(parsed.messageId))
+            continue;
           const swipeBound = liveSwipeCounts.get(parsed.messageId);
-          if (swipeBound === undefined || parsed.swipeId >= swipeBound) {
+          if (swipeBound !== undefined ? parsed.swipeId >= swipeBound : !mutatedDuringFetch && !recentlyCompletedIds.has(parsed.messageId)) {
             delete meta[key];
             contentMap.delete(key);
           }
@@ -717,8 +778,10 @@ function createBackend(spindle2) {
           const parsed = parseMetaKey(key);
           if (!parsed)
             continue;
+          if (activeProtectedIds.has(parsed.messageId))
+            continue;
           const swipeBound = liveSwipeCounts.get(parsed.messageId);
-          if (swipeBound === undefined || parsed.swipeId >= swipeBound) {
+          if (swipeBound !== undefined ? parsed.swipeId >= swipeBound : !mutatedDuringFetch && !recentlyCompletedIds.has(parsed.messageId)) {
             contentMap.delete(key);
           }
         }
@@ -732,11 +795,11 @@ function createBackend(spindle2) {
       }
       return meta;
     })().finally(() => {
-      if (hydrationInFlight.get(flightKey) === job) {
+      if (hydrationInFlight.get(flightKey)?.promise === job) {
         hydrationInFlight.delete(flightKey);
       }
     });
-    hydrationInFlight.set(flightKey, job);
+    hydrationInFlight.set(flightKey, { epoch: runEpoch, promise: job });
     return job;
   }
   async function verifyStoppedTargetMessage(chatId, targetMessageId, payload, buffer) {
@@ -783,10 +846,17 @@ function createBackend(spindle2) {
       return;
     }
     let messageId = explicitMessageId;
-    let swipeId = typeof payload.swipeId === "number" ? payload.swipeId : typeof payload.targetSwipeId === "number" ? payload.targetSwipeId : buffer?.targetSwipeId ?? 0;
+    const knownStateForExplicit = messageId ? getMessageStatesMap(chatId, userId)[messageId] : undefined;
+    let swipeId = typeof payload.swipeId === "number" ? payload.swipeId : typeof payload.targetSwipeId === "number" ? payload.targetSwipeId : buffer?.targetSwipeId ?? knownStateForExplicit?.swipeId ?? 0;
     let content = typeof payload.content === "string" ? payload.content : undefined;
     if (kind === "ended" && !messageId) {
       messageId = buffer?.targetMessageId;
+      if (messageId && typeof payload.swipeId !== "number" && typeof payload.targetSwipeId !== "number" && buffer?.targetSwipeId === undefined) {
+        const tracked = getMessageStatesMap(chatId, userId)[messageId];
+        if (tracked) {
+          swipeId = tracked.swipeId;
+        }
+      }
     } else if (kind === "stopped" && !messageId) {
       if (!buffer?.targetMessageId) {
         return;
@@ -804,6 +874,7 @@ function createBackend(spindle2) {
     }
     const safeSwipeId = typeof swipeId === "number" && Number.isInteger(swipeId) && swipeId >= 0 ? swipeId : 0;
     const key = makeMetaKey(messageId, safeSwipeId);
+    bumpChatMutationEpoch(chatId, userId);
     const meta = await store.loadChatMeta(chatId, userId);
     const existing = meta[key];
     const startedAt = buffer?.startedAt;
@@ -813,6 +884,7 @@ function createBackend(spindle2) {
     const finishReason = kind === "stopped" ? extractFinishReason(payload) ?? "stopped" : extractFinishReason(payload) ?? existing?.finishReason;
     const stopSequence = extractStopSequence(payload) ?? existing?.stopSequence;
     const stopDetails = extractStopDetails(payload.stopDetails ?? payload.stop_details) ?? existing?.stopDetails;
+    const hasBuffer = buffer !== undefined;
     const lorebookEntries = buffer?.lorebookEntries ?? [];
     const macroNames = buffer ? Array.from(buffer.macroNames) : [];
     const isImpersonate = payload.generationType === "impersonate";
@@ -838,10 +910,10 @@ function createBackend(spindle2) {
         }
       } : {}
     };
-    if (lorebookEntries.length === 0) {
+    if (hasBuffer && lorebookEntries.length === 0) {
       delete record.lorebookTriggers;
     }
-    if (macroNames.length === 0) {
+    if (hasBuffer && macroNames.length === 0) {
       delete record.macrosApplied;
     }
     meta[key] = record;
@@ -850,15 +922,22 @@ function createBackend(spindle2) {
     }
     setMessageState(chatId, messageId, { swipeId: safeSwipeId, isUser }, userId);
     if (generationId) {
+      const now = Date.now();
       recordCompletedRef(generationId, {
         chatId,
         messageId,
         swipeId: safeSwipeId,
-        startedAt: startedAt ?? Date.now()
+        startedAt: startedAt ?? now,
+        completedAt: now
       });
     }
     await store.saveChatMeta(chatId, meta, userId);
     pushChatMeta(chatId, meta, userId);
+    if (!hasBuffer || typeof content !== "string" || !finishReason) {
+      hydrateChat(chatId, userId).then((hydrated) => {
+        pushChatMeta(chatId, hydrated, userId);
+      });
+    }
   }
   async function handleMetricsReady(rawPayload, userId) {
     const payload = asRecord(rawPayload);
@@ -874,6 +953,7 @@ function createBackend(spindle2) {
     const durationMs = extractDurationMs(payload.generationMetrics);
     if (durationMs === undefined)
       return;
+    bumpChatMutationEpoch(chatId, userId);
     const meta = await store.loadChatMeta(chatId, userId);
     const key = makeMetaKey(messageId, swipeId);
     let existing = meta[key];
@@ -890,12 +970,17 @@ function createBackend(spindle2) {
       isUser,
       durationMs
     };
-    const states = getMessageStatesMap(chatId, userId);
-    if (!states[messageId]) {
-      states[messageId] = { swipeId, isUser };
+    if (completedRef && completedRef.swipeId !== swipeId) {
+      completedRef.swipeId = swipeId;
     }
+    setMessageState(chatId, messageId, { swipeId, isUser }, userId);
     await store.saveChatMeta(chatId, meta, userId);
     pushChatMeta(chatId, meta, userId);
+    if (!existing || existing.wordCount === undefined || !existing.finishReason) {
+      hydrateChat(chatId, userId).then((hydrated) => {
+        pushChatMeta(chatId, hydrated, userId);
+      });
+    }
   }
   function registerMacroInterceptorIfPermitted() {
     if (macroInterceptorRegistered)
@@ -917,6 +1002,7 @@ function createBackend(spindle2) {
       const buffer = activeBuffersByChat.get(chatId);
       if (!buffer)
         return;
+      buffer.lastActivityAt = Date.now();
       const names = extractMacroNames(ctx.template);
       if (names.length === 0)
         return;
@@ -940,12 +1026,14 @@ function createBackend(spindle2) {
     generationUnsubs.push(spindle2.on("GENERATION_STARTED", (payload) => {
       if (!payload?.chatId)
         return;
-      pruneStaleBuffers();
+      const now = Date.now();
+      pruneStaleBuffers(now);
       const raw = payload;
       const fresh = {
         generationId: payload.generationId,
         chatId: payload.chatId,
-        startedAt: Date.now(),
+        startedAt: now,
+        lastActivityAt: now,
         targetMessageId: typeof payload.targetMessageId === "string" ? payload.targetMessageId : undefined,
         targetSwipeId: typeof raw.targetSwipeId === "number" && raw.targetSwipeId >= 0 ? Math.floor(raw.targetSwipeId) : undefined,
         streamedMessageIds: new Set,
@@ -959,6 +1047,23 @@ function createBackend(spindle2) {
       activeBuffersByChat.set(payload.chatId, fresh);
       if (payload.generationId) {
         activeBuffersByGenId.set(payload.generationId, fresh);
+      }
+    }));
+    generationUnsubs.push(spindle2.on("GENERATION_IN_PROGRESS", (rawPayload) => {
+      const payload = asRecord(rawPayload);
+      const chatId = typeof payload?.chatId === "string" ? payload.chatId : undefined;
+      if (!chatId)
+        return;
+      const generationId = typeof payload?.generationId === "string" ? payload.generationId : undefined;
+      const buffer = getOrCreateBuffer(chatId, generationId);
+      buffer.lastActivityAt = Date.now();
+      const targetMsgId = typeof payload?.targetMessageId === "string" && payload.targetMessageId.length > 0 ? payload.targetMessageId : typeof payload?.messageId === "string" && payload.messageId.length > 0 ? payload.messageId : undefined;
+      if (targetMsgId && !buffer.targetMessageId) {
+        buffer.targetMessageId = targetMsgId;
+      }
+      const rawSwipeId = typeof payload?.targetSwipeId === "number" ? payload.targetSwipeId : typeof payload?.swipeId === "number" ? payload.swipeId : undefined;
+      if (typeof rawSwipeId === "number" && Number.isInteger(rawSwipeId) && rawSwipeId >= 0 && buffer.targetSwipeId === undefined) {
+        buffer.targetSwipeId = rawSwipeId;
       }
     }));
     generationUnsubs.push(spindle2.on("GENERATION_ENDED", (payload, userId) => {
@@ -976,10 +1081,12 @@ function createBackend(spindle2) {
     const chatId = typeof payload.chatId === "string" ? payload.chatId : undefined;
     if (chatId) {
       const buffer = getOrCreateBuffer(chatId);
+      buffer.lastActivityAt = Date.now();
       buffer.lorebookEntries = entries;
     } else if (activeBuffersByChat.size === 1) {
       const only = activeBuffersByChat.values().next().value;
       if (only) {
+        only.lastActivityAt = Date.now();
         only.lorebookEntries = entries;
       }
     }
@@ -1022,10 +1129,12 @@ function createBackend(spindle2) {
     if (!isUser) {
       const activeBuf = activeBuffersByChat.get(chatId);
       if (activeBuf) {
+        activeBuf.lastActivityAt = Date.now();
         activeBuf.streamedMessageIds.add(message.id);
       }
     }
     (async () => {
+      bumpChatMutationEpoch(chatId, userId);
       const meta = await store.loadChatMeta(chatId, userId);
       const key = makeMetaKey(message.id, swipeId);
       if (typeof message.content === "string") {
@@ -1051,7 +1160,11 @@ function createBackend(spindle2) {
     const isUser = typeof message.is_user === "boolean" ? message.is_user : message.role === "user";
     const activeBuf = activeBuffersByChat.get(chatId);
     const isGeneratingTarget = activeBuf !== undefined && (activeBuf.targetMessageId === message.id || activeBuf.streamedMessageIds.has(message.id));
+    if (isGeneratingTarget && activeBuf) {
+      activeBuf.lastActivityAt = Date.now();
+    }
     (async () => {
+      bumpChatMutationEpoch(chatId, userId);
       const meta = await store.loadChatMeta(chatId, userId);
       const key = makeMetaKey(message.id, swipeId);
       const existing = meta[key];
@@ -1081,6 +1194,7 @@ function createBackend(spindle2) {
     if (!chatId || !messageId)
       return;
     (async () => {
+      bumpChatMutationEpoch(chatId, userId);
       const meta = await store.loadChatMeta(chatId, userId);
       const contentMap = getLastKnownContentMap(chatId, userId);
       const prefix = `${messageId}:`;
@@ -1097,6 +1211,11 @@ function createBackend(spindle2) {
         }
       }
       deleteMessageState(chatId, messageId, userId);
+      for (const [genId, ref] of completedRefsByGenId.entries()) {
+        if (ref.chatId === chatId && ref.messageId === messageId) {
+          completedRefsByGenId.delete(genId);
+        }
+      }
       if (changed) {
         await store.saveChatMeta(chatId, meta, userId);
       }
@@ -1107,10 +1226,26 @@ function createBackend(spindle2) {
     if (!payload?.chatId || !payload.message?.id)
       return;
     const { chatId, message, action, swipeId } = payload;
+    const isUser = typeof message.is_user === "boolean" ? message.is_user : message.role === "user";
+    const activeSwipeId = typeof message.swipe_id === "number" && message.swipe_id >= 0 ? Math.floor(message.swipe_id) : 0;
+    const targetSwipe = action === "updated" && Number.isInteger(swipeId) && swipeId >= 0 ? swipeId : activeSwipeId;
+    const activeBuf = activeBuffersByChat.get(chatId);
+    if (!isUser && activeBuf) {
+      activeBuf.lastActivityAt = Date.now();
+      if (action === "added") {
+        if (!activeBuf.targetMessageId) {
+          activeBuf.targetMessageId = message.id;
+        }
+        if (activeBuf.targetMessageId === message.id) {
+          activeBuf.targetSwipeId = activeSwipeId;
+        }
+      }
+    }
+    const isGeneratingTarget = activeBuf !== undefined && (activeBuf.targetMessageId === message.id || activeBuf.streamedMessageIds.has(message.id) || !isUser && typeof activeBuf.targetSwipeId === "number" && activeBuf.targetSwipeId === targetSwipe);
     (async () => {
+      bumpChatMutationEpoch(chatId, userId);
       const meta = await store.loadChatMeta(chatId, userId);
       const contentMap = getLastKnownContentMap(chatId, userId);
-      const isUser = typeof message.is_user === "boolean" ? message.is_user : message.role === "user";
       const extra = asRecord(message.extra);
       if (action === "deleted" && Number.isInteger(swipeId) && swipeId >= 0) {
         const shiftedEntries = [];
@@ -1145,8 +1280,6 @@ function createBackend(spindle2) {
           contentMap.set(makeMetaKey(message.id, idx), val);
         }
       }
-      const activeSwipeId = typeof message.swipe_id === "number" && message.swipe_id >= 0 ? Math.floor(message.swipe_id) : 0;
-      const targetSwipe = action === "updated" && Number.isInteger(swipeId) && swipeId >= 0 ? swipeId : activeSwipeId;
       const swipeContent = Array.isArray(message.swipes) && typeof message.swipes[targetSwipe] === "string" ? message.swipes[targetSwipe] : targetSwipe === message.swipe_id && typeof message.content === "string" ? message.content : undefined;
       const key = makeMetaKey(message.id, targetSwipe);
       const prevContent = contentMap.get(key);
@@ -1161,7 +1294,9 @@ function createBackend(spindle2) {
         metrics,
         outcome
       });
-      if (action === "updated" && typeof swipeContent === "string" && (prevContent === undefined || swipeContent !== prevContent)) {
+      const wasStagedBlank = !isUser && prevContent === "";
+      const recentlyGenerated = isRecentlyCompletedTarget(chatId, message.id, targetSwipe);
+      if (action === "updated" && !isGeneratingTarget && !wasStagedBlank && !recentlyGenerated && typeof swipeContent === "string" && (prevContent === undefined ? isUser : swipeContent !== prevContent)) {
         meta[key].edited = true;
         meta[key].editedAt = Date.now();
       }
@@ -1175,6 +1310,7 @@ function createBackend(spindle2) {
       return;
     const { chatId, message } = payload;
     (async () => {
+      bumpChatMutationEpoch(chatId, userId);
       const meta = await store.loadChatMeta(chatId, userId);
       const contentMap = getLastKnownContentMap(chatId, userId);
       const isUser = typeof message.is_user === "boolean" ? message.is_user : message.role === "user";
@@ -1297,6 +1433,7 @@ function createBackend(spindle2) {
       activeBuffersByGenId.clear();
       completedRefsByGenId.clear();
       hydrationInFlight.clear();
+      chatMutationEpoch.clear();
       activeChatIdByUser.clear();
       lastKnownContentByChat.clear();
       messageStatesByChat.clear();

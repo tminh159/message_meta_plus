@@ -16,8 +16,8 @@ import { createPortalTooltipController } from "./frontend/tooltip.js";
 import { createSettingsDrawer } from "./frontend/settings-drawer.js";
 
 interface CachedMessageInfo {
-  swipeId: number;
-  isUser: boolean;
+  swipeId?: number;
+  isUser?: boolean;
   content?: string;
 }
 
@@ -77,6 +77,7 @@ const REFRESH_EVENTS = [
   "CHAT_CHANGED",
   "MESSAGE_DELETED",
   "GENERATION_ENDED",
+  "GENERATION_STOPPED",
   "GENERATION_METRICS_READY",
   "CHARACTER_MESSAGE_RENDERED",
   "USER_MESSAGE_RENDERED",
@@ -327,8 +328,8 @@ export function setup(ctx: SpindleFrontendContext): () => void {
     const swipeId =
       typeof msg.swipe_id === "number" && Number.isFinite(msg.swipe_id) && msg.swipe_id >= 0
         ? Math.floor(msg.swipe_id)
-        : prev?.swipeId ?? 0;
-    const isUser = typeof msg.is_user === "boolean" ? msg.is_user : prev?.isUser ?? false;
+        : prev?.swipeId;
+    const isUser = typeof msg.is_user === "boolean" ? msg.is_user : prev?.isUser;
     const content = typeof msg.content === "string" ? msg.content : prev?.content;
     messageInfoCache.set(msg.id, { swipeId, isUser, content });
   };
@@ -389,8 +390,25 @@ export function setup(ctx: SpindleFrontendContext): () => void {
     let swipeId = cached?.swipeId ?? backendState?.swipeId ?? domSwipe ?? 0;
     let record = metaMap[makeMetaKey(messageId, swipeId)];
 
+    // If chosen swipeId has no record yet (e.g. cached DTO pre-dates swipe/metrics),
+    // prefer the backend state or DOM swipe slot when it holds a record.
+    if (!record && backendState !== undefined) {
+      const backendRecord = metaMap[makeMetaKey(messageId, backendState.swipeId)];
+      if (backendRecord) {
+        swipeId = backendState.swipeId;
+        record = backendRecord;
+      }
+    }
+    if (!record && domSwipe !== undefined) {
+      const domRecord = metaMap[makeMetaKey(messageId, domSwipe)];
+      if (domRecord) {
+        swipeId = domSwipe;
+        record = domRecord;
+      }
+    }
+
     // If swipeId wasn't explicitly known and default :0 has no record, check for a matching key
-    if (!record && cached === undefined && backendState === undefined && domSwipe === undefined) {
+    if (!record && cached?.swipeId === undefined && backendState === undefined && domSwipe === undefined) {
       const prefix = `${messageId}:`;
       for (const key of Object.keys(metaMap)) {
         if (key.startsWith(prefix)) {
@@ -592,6 +610,18 @@ export function setup(ctx: SpindleFrontendContext): () => void {
         if (destroyed) return;
         let shouldScan = false;
         for (const mutation of mutations) {
+          if (mutation.type === "attributes") {
+            const target = mutation.target as Element | null;
+            if (
+              target &&
+              target.nodeType === 1 &&
+              (target.hasAttribute("data-message-id") || target.closest?.("[data-message-id]"))
+            ) {
+              shouldScan = true;
+              break;
+            }
+            continue;
+          }
           for (const added of mutation.addedNodes) {
             if (nodeContainsMessageMount(added)) {
               shouldScan = true;
@@ -610,7 +640,12 @@ export function setup(ctx: SpindleFrontendContext): () => void {
     }
 
     currentObserveRoot = targetRoot;
-    observer.observe(targetRoot, { childList: true, subtree: true });
+    observer.observe(targetRoot, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ["data-part", "data-message-id"],
+    });
   };
 
   const handleEventPayload = (eventName: string, payload: unknown): void => {
@@ -679,6 +714,15 @@ export function setup(ctx: SpindleFrontendContext): () => void {
       return;
     }
 
+    const isGenerationTerminalEvent =
+      eventName === "GENERATION_ENDED" ||
+      eventName === "GENERATION_STOPPED" ||
+      eventName === "GENERATION_METRICS_READY";
+
+    if (isGenerationTerminalEvent) {
+      syncRecentMessagesIntoCache();
+    }
+
     if (isRecord(data.message)) {
       cacheMessageDto(data.message as Partial<ChatMessageDTO> & { id?: string });
     } else if (typeof data.messageId === "string") {
@@ -697,17 +741,26 @@ export function setup(ctx: SpindleFrontendContext): () => void {
           ? data.messageId
           : null;
 
+    if (isGenerationTerminalEvent) {
+      const reqChatId =
+        typeof data.chatId === "string" && data.chatId.length > 0
+          ? data.chatId
+          : activeChatId;
+      if (reqChatId) {
+        ctx.sendToBackend({ type: "get-chat-meta", chatId: reqChatId });
+        if (targetMessageId && messageInfoCache.get(targetMessageId)?.content === undefined) {
+          void hydrateMessageCacheFromHost(reqChatId);
+        }
+      }
+    }
+
     if (targetMessageId) {
       const bubbleEl = ctx.dom.findMessageElement(targetMessageId);
       if (bubbleEl) {
         renderMessageBubble(targetMessageId, bubbleEl);
-        return;
-      }
-    }
-
-    if (eventName === "GENERATION_ENDED" || eventName === "GENERATION_METRICS_READY") {
-      if (activeChatId) {
-        ctx.sendToBackend({ type: "get-chat-meta", chatId: activeChatId });
+        if (!isGenerationTerminalEvent) {
+          return;
+        }
       }
     }
 
@@ -775,16 +828,86 @@ export function setup(ctx: SpindleFrontendContext): () => void {
     if (unsub) unsubscribers.push(unsub);
   }
 
-  // Subscribe to active chat selector if host provides ctx.state
+  let lastObservedMessageCount: number | null = null;
+
+  const syncActiveChatOnResume = (): void => {
+    if (destroyed) return;
+    const currentChatId = ctx.getActiveChat?.().chatId ?? activeChatId;
+    if (currentChatId && currentChatId !== activeChatId) {
+      lastObservedMessageCount = null;
+      handleEventPayload("CHAT_SWITCHED", { chatId: currentChatId });
+      return;
+    }
+    if (!activeChatId) return;
+    ctx.sendToBackend({ type: "get-chat-meta", chatId: activeChatId });
+    void hydrateMessageCacheFromHost(activeChatId);
+    ensureObserverBound();
+    scheduleScan();
+  };
+
+  const unsubConnected = subscribeEvent("CONNECTED", (payload) => {
+    if (destroyed) return;
+    const data = isRecord(payload) ? payload : null;
+    if (data && "role" in data && !data.role) return;
+    ctx.sendToBackend({ type: "get-state" });
+    syncActiveChatOnResume();
+  });
+  if (unsubConnected) unsubscribers.push(unsubConnected);
+
+  if (typeof document !== "undefined" && typeof document.addEventListener === "function") {
+    const onVisibilityChange = (): void => {
+      if (document.visibilityState === "visible") {
+        syncActiveChatOnResume();
+      }
+    };
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    unsubscribers.push(() => {
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+    });
+  }
+
+  if (typeof window !== "undefined" && typeof window.addEventListener === "function") {
+    const onWindowFocus = (): void => {
+      syncActiveChatOnResume();
+    };
+    window.addEventListener("focus", onWindowFocus);
+    unsubscribers.push(() => {
+      window.removeEventListener("focus", onWindowFocus);
+    });
+  }
+
+  // Subscribe to active chat & message count selectors if host provides ctx.state
   try {
     if (ctx.state && typeof ctx.state.subscribe === "function") {
       const unsubChatState = ctx.state.subscribe<{ chatId?: string | null }>("chat.active", (val) => {
         const nextId = val?.chatId ?? null;
         if (nextId !== activeChatId) {
+          lastObservedMessageCount = null;
           handleEventPayload("CHAT_SWITCHED", { chatId: nextId });
         }
       });
       unsubscribers.push(unsubChatState);
+
+      const unsubCountState = ctx.state.subscribe<{ count?: number } | number>(
+        "chat.messageCount",
+        (val) => {
+          const count =
+            typeof val === "number"
+              ? val
+              : isRecord(val) && typeof val.count === "number"
+                ? val.count
+                : null;
+          if (count === null) return;
+          const prev = lastObservedMessageCount;
+          lastObservedMessageCount = count;
+          if (prev !== null && count !== prev && activeChatId) {
+            ctx.sendToBackend({ type: "get-chat-meta", chatId: activeChatId });
+            void hydrateMessageCacheFromHost(activeChatId);
+            scheduleScan();
+          }
+        },
+      );
+      unsubscribers.push(unsubCountState);
     }
   } catch {
     // Optional host selector

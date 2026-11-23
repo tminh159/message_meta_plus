@@ -1826,6 +1826,7 @@ var REFRESH_EVENTS = [
   "CHAT_CHANGED",
   "MESSAGE_DELETED",
   "GENERATION_ENDED",
+  "GENERATION_STOPPED",
   "GENERATION_METRICS_READY",
   "CHARACTER_MESSAGE_RENDERED",
   "USER_MESSAGE_RENDERED"
@@ -2019,8 +2020,8 @@ function setup(ctx) {
     if (!msg || typeof msg.id !== "string" || !msg.id)
       return;
     const prev = messageInfoCache.get(msg.id);
-    const swipeId = typeof msg.swipe_id === "number" && Number.isFinite(msg.swipe_id) && msg.swipe_id >= 0 ? Math.floor(msg.swipe_id) : prev?.swipeId ?? 0;
-    const isUser = typeof msg.is_user === "boolean" ? msg.is_user : prev?.isUser ?? false;
+    const swipeId = typeof msg.swipe_id === "number" && Number.isFinite(msg.swipe_id) && msg.swipe_id >= 0 ? Math.floor(msg.swipe_id) : prev?.swipeId;
+    const isUser = typeof msg.is_user === "boolean" ? msg.is_user : prev?.isUser;
     const content = typeof msg.content === "string" ? msg.content : prev?.content;
     messageInfoCache.set(msg.id, { swipeId, isUser, content });
   };
@@ -2060,7 +2061,21 @@ function setup(ctx) {
     const domSwipe = domSwipeRaw !== null && Number.isFinite(Number(domSwipeRaw)) && Number(domSwipeRaw) >= 0 ? Math.floor(Number(domSwipeRaw)) : undefined;
     let swipeId = cached?.swipeId ?? backendState?.swipeId ?? domSwipe ?? 0;
     let record = metaMap[makeMetaKey(messageId, swipeId)];
-    if (!record && cached === undefined && backendState === undefined && domSwipe === undefined) {
+    if (!record && backendState !== undefined) {
+      const backendRecord = metaMap[makeMetaKey(messageId, backendState.swipeId)];
+      if (backendRecord) {
+        swipeId = backendState.swipeId;
+        record = backendRecord;
+      }
+    }
+    if (!record && domSwipe !== undefined) {
+      const domRecord = metaMap[makeMetaKey(messageId, domSwipe)];
+      if (domRecord) {
+        swipeId = domSwipe;
+        record = domRecord;
+      }
+    }
+    if (!record && cached?.swipeId === undefined && backendState === undefined && domSwipe === undefined) {
       const prefix = `${messageId}:`;
       for (const key of Object.keys(metaMap)) {
         if (key.startsWith(prefix)) {
@@ -2221,6 +2236,14 @@ function setup(ctx) {
           return;
         let shouldScan = false;
         for (const mutation of mutations) {
+          if (mutation.type === "attributes") {
+            const target = mutation.target;
+            if (target && target.nodeType === 1 && (target.hasAttribute("data-message-id") || target.closest?.("[data-message-id]"))) {
+              shouldScan = true;
+              break;
+            }
+            continue;
+          }
           for (const added of mutation.addedNodes) {
             if (nodeContainsMessageMount(added)) {
               shouldScan = true;
@@ -2239,7 +2262,12 @@ function setup(ctx) {
       });
     }
     currentObserveRoot = targetRoot;
-    observer.observe(targetRoot, { childList: true, subtree: true });
+    observer.observe(targetRoot, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ["data-part", "data-message-id"]
+    });
   };
   const handleEventPayload = (eventName, payload) => {
     if (destroyed)
@@ -2291,6 +2319,10 @@ function setup(ctx) {
       scheduleScan();
       return;
     }
+    const isGenerationTerminalEvent = eventName === "GENERATION_ENDED" || eventName === "GENERATION_STOPPED" || eventName === "GENERATION_METRICS_READY";
+    if (isGenerationTerminalEvent) {
+      syncRecentMessagesIntoCache();
+    }
     if (isRecord(data.message)) {
       cacheMessageDto(data.message);
     } else if (typeof data.messageId === "string") {
@@ -2302,16 +2334,22 @@ function setup(ctx) {
       });
     }
     const targetMessageId = isRecord(data.message) && typeof data.message.id === "string" ? data.message.id : typeof data.messageId === "string" ? data.messageId : null;
+    if (isGenerationTerminalEvent) {
+      const reqChatId = typeof data.chatId === "string" && data.chatId.length > 0 ? data.chatId : activeChatId;
+      if (reqChatId) {
+        ctx.sendToBackend({ type: "get-chat-meta", chatId: reqChatId });
+        if (targetMessageId && messageInfoCache.get(targetMessageId)?.content === undefined) {
+          hydrateMessageCacheFromHost(reqChatId);
+        }
+      }
+    }
     if (targetMessageId) {
       const bubbleEl = ctx.dom.findMessageElement(targetMessageId);
       if (bubbleEl) {
         renderMessageBubble(targetMessageId, bubbleEl);
-        return;
-      }
-    }
-    if (eventName === "GENERATION_ENDED" || eventName === "GENERATION_METRICS_READY") {
-      if (activeChatId) {
-        ctx.sendToBackend({ type: "get-chat-meta", chatId: activeChatId });
+        if (!isGenerationTerminalEvent) {
+          return;
+        }
       }
     }
     scheduleScan();
@@ -2366,15 +2404,77 @@ function setup(ctx) {
     if (unsub)
       unsubscribers.push(unsub);
   }
+  let lastObservedMessageCount = null;
+  const syncActiveChatOnResume = () => {
+    if (destroyed)
+      return;
+    const currentChatId = ctx.getActiveChat?.().chatId ?? activeChatId;
+    if (currentChatId && currentChatId !== activeChatId) {
+      lastObservedMessageCount = null;
+      handleEventPayload("CHAT_SWITCHED", { chatId: currentChatId });
+      return;
+    }
+    if (!activeChatId)
+      return;
+    ctx.sendToBackend({ type: "get-chat-meta", chatId: activeChatId });
+    hydrateMessageCacheFromHost(activeChatId);
+    ensureObserverBound();
+    scheduleScan();
+  };
+  const unsubConnected = subscribeEvent("CONNECTED", (payload) => {
+    if (destroyed)
+      return;
+    const data = isRecord(payload) ? payload : null;
+    if (data && "role" in data && !data.role)
+      return;
+    ctx.sendToBackend({ type: "get-state" });
+    syncActiveChatOnResume();
+  });
+  if (unsubConnected)
+    unsubscribers.push(unsubConnected);
+  if (typeof document !== "undefined" && typeof document.addEventListener === "function") {
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "visible") {
+        syncActiveChatOnResume();
+      }
+    };
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    unsubscribers.push(() => {
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+    });
+  }
+  if (typeof window !== "undefined" && typeof window.addEventListener === "function") {
+    const onWindowFocus = () => {
+      syncActiveChatOnResume();
+    };
+    window.addEventListener("focus", onWindowFocus);
+    unsubscribers.push(() => {
+      window.removeEventListener("focus", onWindowFocus);
+    });
+  }
   try {
     if (ctx.state && typeof ctx.state.subscribe === "function") {
       const unsubChatState = ctx.state.subscribe("chat.active", (val) => {
         const nextId = val?.chatId ?? null;
         if (nextId !== activeChatId) {
+          lastObservedMessageCount = null;
           handleEventPayload("CHAT_SWITCHED", { chatId: nextId });
         }
       });
       unsubscribers.push(unsubChatState);
+      const unsubCountState = ctx.state.subscribe("chat.messageCount", (val) => {
+        const count = typeof val === "number" ? val : isRecord(val) && typeof val.count === "number" ? val.count : null;
+        if (count === null)
+          return;
+        const prev = lastObservedMessageCount;
+        lastObservedMessageCount = count;
+        if (prev !== null && count !== prev && activeChatId) {
+          ctx.sendToBackend({ type: "get-chat-meta", chatId: activeChatId });
+          hydrateMessageCacheFromHost(activeChatId);
+          scheduleScan();
+        }
+      });
+      unsubscribers.push(unsubCountState);
     }
   } catch {}
   ensureObserverBound();

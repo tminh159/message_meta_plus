@@ -1138,4 +1138,156 @@ describe("Message Meta Plus Frontend Host Integration", () => {
       host.dom.window.HTMLElement.prototype.getBoundingClientRect = origGetRect;
     }
   });
+
+  test("GENERATION_ENDED, GENERATION_STOPPED, and GENERATION_METRICS_READY request get-chat-meta even when bubble is already mounted and use authoritative backend swipeId", async () => {
+    const host = (activeHost = new MockFrontendHost());
+    const bubble = host.mountMessageDom({ id: "msg-slow", layout: "bubble", isUser: false });
+    host.messages = [
+      { id: "msg-slow", is_user: false, swipe_id: 0, content: "" },
+    ];
+    host.mount();
+    host.pushFromBackend({
+      type: "state-update",
+      settings: DEFAULT_SETTINGS,
+      activeChatId: "chat-1",
+      meta: {},
+      messageStates: {},
+    });
+
+    // Clear initial mount requests
+    host.sentToBackend.length = 0;
+
+    // Bubble already exists in DOM; slow generation ends without swipeId
+    host.emitEvent("GENERATION_ENDED", {
+      chatId: "chat-1",
+      messageId: "msg-slow",
+      content: "Slow finished reply",
+      finish_reason: "stop",
+    });
+    expect(
+      host.sentToBackend.filter((m) => m.type === "get-chat-meta" && m.chatId === "chat-1"),
+    ).toHaveLength(1);
+
+    host.sentToBackend.length = 0;
+    host.emitEvent("GENERATION_METRICS_READY", {
+      chatId: "chat-1",
+      messageId: "msg-slow",
+      swipeId: 2,
+      generationMetrics: { durationMs: 210_000 },
+    });
+    expect(
+      host.sentToBackend.filter((m) => m.type === "get-chat-meta" && m.chatId === "chat-1"),
+    ).toHaveLength(1);
+
+    host.sentToBackend.length = 0;
+    host.emitEvent("GENERATION_STOPPED", {
+      chatId: "chat-1",
+      messageId: "msg-slow",
+    });
+    expect(
+      host.sentToBackend.filter((m) => m.type === "get-chat-meta" && m.chatId === "chat-1"),
+    ).toHaveLength(1);
+
+    // Backend responds with metadata stored at swipe 2 while cached DTO had swipe 0 from initial message list
+    host.pushFromBackend({
+      type: "chat-meta-update",
+      chatId: "chat-1",
+      meta: {
+        "msg-slow:2": {
+          isUser: false,
+          durationMs: 210_000,
+          finishReason: "stop",
+          wordCount: 3,
+        },
+      },
+      messageStates: {
+        "msg-slow": { swipeId: 2, isUser: false },
+      },
+    });
+    await flush();
+
+    const pill = bubble.querySelector("[data-mmp-pill]");
+    expect(pill).not.toBeNull();
+    expect(pill?.textContent).toBe("00:03:30");
+  });
+
+  test("re-renders when data-part transitions from streaming to character via MutationObserver attribute watch", async () => {
+    const host = (activeHost = new MockFrontendHost());
+    const bubble = host.mountMessageDom({ id: "msg-stream", layout: "bubble", isUser: false });
+    const innerCard = bubble.querySelector('[data-component="BubbleMessage"]')!;
+    innerCard.setAttribute("data-part", "streaming");
+
+    host.messages = [{ id: "msg-stream", is_user: false, swipe_id: 0, content: "" }];
+    host.mount();
+    host.pushFromBackend({
+      type: "state-update",
+      settings: {
+        ...DEFAULT_SETTINGS,
+        fields: {
+          ...DEFAULT_SETTINGS.fields,
+          generationTime: "hidden",
+          finishReason: "hidden",
+          wordCount: "inline",
+        },
+      },
+      activeChatId: "chat-1",
+      meta: {},
+      messageStates: {},
+    });
+    await flush();
+
+    // Before streaming finishes, empty content shows 0w
+    expect(bubble.querySelector("[data-mmp-pill]")?.textContent).toBe("0w");
+
+    // Streaming completes: store has final content and card transitions data-part="streaming" -> "character"
+    host.messages = [
+      { id: "msg-stream", is_user: false, swipe_id: 0, content: "One two three four" },
+    ];
+    innerCard.setAttribute("data-part", "character");
+    await flush();
+
+    const pill = bubble.querySelector("[data-mmp-pill]");
+    expect(pill).not.toBeNull();
+    expect(pill?.textContent).toBe("4w");
+  });
+
+  test("resyncs on CONNECTED reconnect, window focus, and chat.messageCount changes and cleans up on teardown", () => {
+    const host = (activeHost = new MockFrontendHost());
+    host.mount();
+    host.sentToBackend.length = 0;
+
+    // Authenticated WS reconnect pushes state & chat meta sync
+    host.emitEvent("CONNECTED", { role: "owner" });
+    expect(host.sentToBackend.some((m) => m.type === "get-state")).toBe(true);
+    expect(host.sentToBackend.some((m) => m.type === "get-chat-meta" && m.chatId === "chat-1")).toBe(
+      true,
+    );
+
+    // Window focus resyncs active chat
+    host.sentToBackend.length = 0;
+    host.dom.window.dispatchEvent(new host.dom.window.Event("focus"));
+    expect(host.sentToBackend.some((m) => m.type === "get-chat-meta" && m.chatId === "chat-1")).toBe(
+      true,
+    );
+
+    // chat.messageCount baseline does not duplicate sync, subsequent increment triggers sync
+    host.sentToBackend.length = 0;
+    for (const cb of host.stateListeners.get("chat.messageCount") ?? []) {
+      cb(5);
+    }
+    expect(host.sentToBackend.some((m) => m.type === "get-chat-meta")).toBe(false);
+
+    for (const cb of host.stateListeners.get("chat.messageCount") ?? []) {
+      cb(6);
+    }
+    expect(host.sentToBackend.some((m) => m.type === "get-chat-meta" && m.chatId === "chat-1")).toBe(
+      true,
+    );
+
+    // Teardown detaches focus/state/CONNECTED listeners
+    host.destroy();
+    host.sentToBackend.length = 0;
+    host.dom.window.dispatchEvent(new host.dom.window.Event("focus"));
+    expect(host.sentToBackend).toHaveLength(0);
+  });
 });

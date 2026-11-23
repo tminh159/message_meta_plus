@@ -38,6 +38,7 @@ interface GenerationBuffer {
   generationId?: string;
   chatId: string;
   startedAt: number;
+  lastActivityAt: number;
   targetMessageId?: string;
   targetSwipeId?: number;
   streamedMessageIds: Set<string>;
@@ -50,10 +51,11 @@ interface CompletedGenerationRef {
   messageId: string;
   swipeId: number;
   startedAt: number;
+  completedAt: number;
 }
 
 const MAX_COMPLETED_REFS = 500;
-const STALE_BUFFER_TTL_MS = 10 * 60 * 1000;
+const STALE_BUFFER_TTL_MS = 60 * 60 * 1000;
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" && !Array.isArray(value)
@@ -115,7 +117,11 @@ export function createBackend(spindle: SpindleAPI): BackendController {
   const activeBuffersByChat = new Map<string, GenerationBuffer>();
   const activeBuffersByGenId = new Map<string, GenerationBuffer>();
   const completedRefsByGenId = new Map<string, CompletedGenerationRef>();
-  const hydrationInFlight = new Map<string, Promise<ChatMetaMap>>();
+  const hydrationInFlight = new Map<
+    string,
+    { epoch: number; promise: Promise<ChatMetaMap> }
+  >();
+  const chatMutationEpoch = new Map<string, number>();
   const activeChatIdByUser = new Map<string, string | null>();
   const lastKnownContentByChat = new Map<string, Map<string, string>>();
   const messageStatesByChat = new Map<string, Record<string, MessageStateSummary>>();
@@ -209,6 +215,17 @@ export function createBackend(spindle: SpindleAPI): BackendController {
     }
   }
 
+  function getChatMutationEpoch(chatId: string, userId?: string): number {
+    return chatMutationEpoch.get(chatScopeKey(chatId, userId)) ?? 0;
+  }
+
+  function bumpChatMutationEpoch(chatId: string, userId?: string): number {
+    const scope = chatScopeKey(chatId, userId);
+    const next = (chatMutationEpoch.get(scope) ?? 0) + 1;
+    chatMutationEpoch.set(scope, next);
+    return next;
+  }
+
   function sendToFrontend(msg: BackendToFrontendMessage, userId?: string): void {
     spindle.sendToFrontend(msg, userId);
   }
@@ -252,7 +269,7 @@ export function createBackend(spindle: SpindleAPI): BackendController {
   function pruneStaleBuffers(now: number = Date.now()): void {
     const cutoff = now - STALE_BUFFER_TTL_MS;
     for (const [genId, buf] of activeBuffersByGenId.entries()) {
-      if (buf.startedAt < cutoff) {
+      if (buf.lastActivityAt < cutoff) {
         activeBuffersByGenId.delete(genId);
         if (activeBuffersByChat.get(buf.chatId) === buf) {
           activeBuffersByChat.delete(buf.chatId);
@@ -260,17 +277,21 @@ export function createBackend(spindle: SpindleAPI): BackendController {
       }
     }
     for (const [chatId, buf] of activeBuffersByChat.entries()) {
-      if (buf.startedAt < cutoff) {
+      if (buf.lastActivityAt < cutoff) {
         activeBuffersByChat.delete(chatId);
       }
     }
   }
 
   function getOrCreateBuffer(chatId: string, generationId?: string): GenerationBuffer {
-    pruneStaleBuffers();
+    const now = Date.now();
+    pruneStaleBuffers(now);
     if (generationId) {
       const byId = activeBuffersByGenId.get(generationId);
-      if (byId) return byId;
+      if (byId) {
+        byId.lastActivityAt = now;
+        return byId;
+      }
     }
     const existing = activeBuffersByChat.get(chatId);
     if (existing && (!generationId || !existing.generationId || existing.generationId === generationId)) {
@@ -278,12 +299,14 @@ export function createBackend(spindle: SpindleAPI): BackendController {
         existing.generationId = generationId;
         activeBuffersByGenId.set(generationId, existing);
       }
+      existing.lastActivityAt = now;
       return existing;
     }
     const created: GenerationBuffer = {
       generationId,
       chatId,
-      startedAt: Date.now(),
+      startedAt: now,
+      lastActivityAt: now,
       streamedMessageIds: new Set<string>(),
       lorebookEntries: [],
       macroNames: new Set<string>(),
@@ -316,6 +339,26 @@ export function createBackend(spindle: SpindleAPI): BackendController {
       }
     }
     completedRefsByGenId.set(generationId, ref);
+  }
+
+  function isRecentlyCompletedTarget(
+    chatId: string,
+    messageId: string,
+    swipeId: number,
+    windowMs: number = 30_000,
+  ): boolean {
+    const cutoff = Date.now() - windowMs;
+    for (const ref of completedRefsByGenId.values()) {
+      if (
+        ref.chatId === chatId &&
+        ref.messageId === messageId &&
+        ref.swipeId === swipeId &&
+        ref.completedAt >= cutoff
+      ) {
+        return true;
+      }
+    }
+    return false;
   }
 
   function mergeExtraIntoRecord(
@@ -362,24 +405,53 @@ export function createBackend(spindle: SpindleAPI): BackendController {
 
   async function hydrateChat(chatId: string, userId?: string): Promise<ChatMetaMap> {
     const flightKey = chatScopeKey(chatId, userId);
+    const startEpoch = getChatMutationEpoch(chatId, userId);
     const existingFlight = hydrationInFlight.get(flightKey);
     if (existingFlight) {
-      return existingFlight;
+      if (existingFlight.epoch >= startEpoch) {
+        return existingFlight.promise;
+      }
+      await existingFlight.promise.catch(() => undefined);
+      return hydrateChat(chatId, userId);
     }
 
+    const runEpoch = getChatMutationEpoch(chatId, userId);
     const job = (async () => {
-      const meta = await store.loadChatMeta(chatId, userId);
+      const initialMeta = await store.loadChatMeta(chatId, userId);
       if (!hasPermission("chat_mutation") || typeof spindle.chat?.getMessages !== "function") {
-        return meta;
+        return initialMeta;
       }
 
+      let meta = initialMeta;
       try {
         const messages = await spindle.chat.getMessages(chatId);
         if (!Array.isArray(messages)) {
           return meta;
         }
 
+        const mutatedDuringFetch = getChatMutationEpoch(chatId, userId) !== runEpoch;
+        meta = await store.loadChatMeta(chatId, userId);
+
+        const activeBuf = activeBuffersByChat.get(chatId);
+        const activeProtectedIds = new Set<string>();
+        if (activeBuf?.targetMessageId) {
+          activeProtectedIds.add(activeBuf.targetMessageId);
+        }
+        if (activeBuf) {
+          for (const id of activeBuf.streamedMessageIds) {
+            activeProtectedIds.add(id);
+          }
+        }
+        const recentlyCompletedIds = new Set<string>();
+        const recentCutoff = Date.now() - 60_000;
+        for (const ref of completedRefsByGenId.values()) {
+          if (ref.chatId === chatId && ref.completedAt >= recentCutoff) {
+            recentlyCompletedIds.add(ref.messageId);
+          }
+        }
+
         const liveSwipeCounts = new Map<string, number>();
+        const existingStates = messageStatesByChat.get(flightKey);
         const nextStates: Record<string, MessageStateSummary> = {};
         const contentMap = getLastKnownContentMap(chatId, userId);
 
@@ -398,7 +470,11 @@ export function createBackend(spindle: SpindleAPI): BackendController {
           const swipes = Array.isArray(msg.swipes) ? msg.swipes : [];
 
           liveSwipeCounts.set(msg.id, swipes.length > 0 ? swipes.length : activeSwipeId + 1);
-          nextStates[msg.id] = { swipeId: activeSwipeId, isUser };
+          const prevLiveState = mutatedDuringFetch ? existingStates?.[msg.id] : undefined;
+          nextStates[msg.id] =
+            prevLiveState && meta[makeMetaKey(msg.id, prevLiveState.swipeId)]
+              ? { swipeId: prevLiveState.swipeId, isUser: prevLiveState.isUser }
+              : { swipeId: activeSwipeId, isUser };
 
           if (swipes.length > 0) {
             for (let idx = 0; idx < swipes.length; idx++) {
@@ -410,7 +486,13 @@ export function createBackend(spindle: SpindleAPI): BackendController {
                     ? msg.content
                     : undefined;
               const key = makeMetaKey(msg.id, idx);
-              if (typeof content === "string") {
+              const existingRecord = meta[key];
+              const preserveLiveWords =
+                mutatedDuringFetch &&
+                existingRecord?.wordCount !== undefined &&
+                existingRecord.wordCount > 0 &&
+                (!content || content.trim().length === 0);
+              if (typeof content === "string" && !preserveLiveWords) {
                 contentMap.set(key, content);
               }
               const metrics = getSwipeValue(
@@ -425,33 +507,46 @@ export function createBackend(spindle: SpindleAPI): BackendController {
                 idx,
                 activeSwipeId,
               );
-              meta[key] = mergeExtraIntoRecord(meta[key], {
+              meta[key] = mergeExtraIntoRecord(existingRecord, {
                 isUser,
-                content,
+                content: preserveLiveWords ? undefined : content,
                 metrics,
                 outcome,
               });
             }
           } else {
             const key = makeMetaKey(msg.id, activeSwipeId);
-            if (typeof msg.content === "string") {
-              contentMap.set(key, msg.content);
+            const rawContent = typeof msg.content === "string" ? msg.content : undefined;
+            const existingRecord = meta[key];
+            const preserveLiveWords =
+              mutatedDuringFetch &&
+              existingRecord?.wordCount !== undefined &&
+              existingRecord.wordCount > 0 &&
+              (!rawContent || rawContent.trim().length === 0);
+            if (typeof rawContent === "string" && !preserveLiveWords) {
+              contentMap.set(key, rawContent);
             }
-            meta[key] = mergeExtraIntoRecord(meta[key], {
+            meta[key] = mergeExtraIntoRecord(existingRecord, {
               isUser,
-              content: typeof msg.content === "string" ? msg.content : undefined,
+              content: preserveLiveWords ? undefined : rawContent,
               metrics: extra?.generationMetrics,
               outcome: extra?.generationOutcome,
             });
           }
         }
 
-        // Prune records belonging to deleted messages or out-of-range swipes.
+        // Prune records belonging to deleted messages or out-of-range swipes,
+        // while preserving targets created during an active generation or concurrent mutation.
         for (const key of Object.keys(meta)) {
           const parsed = parseMetaKey(key);
           if (!parsed) continue;
+          if (activeProtectedIds.has(parsed.messageId)) continue;
           const swipeBound = liveSwipeCounts.get(parsed.messageId);
-          if (swipeBound === undefined || parsed.swipeId >= swipeBound) {
+          if (
+            swipeBound !== undefined
+              ? parsed.swipeId >= swipeBound
+              : !mutatedDuringFetch && !recentlyCompletedIds.has(parsed.messageId)
+          ) {
             delete meta[key];
             contentMap.delete(key);
           }
@@ -459,8 +554,13 @@ export function createBackend(spindle: SpindleAPI): BackendController {
         for (const key of contentMap.keys()) {
           const parsed = parseMetaKey(key);
           if (!parsed) continue;
+          if (activeProtectedIds.has(parsed.messageId)) continue;
           const swipeBound = liveSwipeCounts.get(parsed.messageId);
-          if (swipeBound === undefined || parsed.swipeId >= swipeBound) {
+          if (
+            swipeBound !== undefined
+              ? parsed.swipeId >= swipeBound
+              : !mutatedDuringFetch && !recentlyCompletedIds.has(parsed.messageId)
+          ) {
             contentMap.delete(key);
           }
         }
@@ -476,12 +576,12 @@ export function createBackend(spindle: SpindleAPI): BackendController {
 
       return meta;
     })().finally(() => {
-      if (hydrationInFlight.get(flightKey) === job) {
+      if (hydrationInFlight.get(flightKey)?.promise === job) {
         hydrationInFlight.delete(flightKey);
       }
     });
 
-    hydrationInFlight.set(flightKey, job);
+    hydrationInFlight.set(flightKey, { epoch: runEpoch, promise: job });
     return job;
   }
 
@@ -581,17 +681,31 @@ export function createBackend(spindle: SpindleAPI): BackendController {
     }
 
     let messageId = explicitMessageId;
+    const knownStateForExplicit = messageId
+      ? getMessageStatesMap(chatId, userId)[messageId]
+      : undefined;
     let swipeId =
       typeof payload.swipeId === "number"
         ? payload.swipeId
         : typeof payload.targetSwipeId === "number"
           ? payload.targetSwipeId
-          : buffer?.targetSwipeId ?? 0;
+          : buffer?.targetSwipeId ?? knownStateForExplicit?.swipeId ?? 0;
     let content =
       typeof payload.content === "string" ? payload.content : undefined;
 
     if (kind === "ended" && !messageId) {
       messageId = buffer?.targetMessageId;
+      if (
+        messageId &&
+        typeof payload.swipeId !== "number" &&
+        typeof payload.targetSwipeId !== "number" &&
+        buffer?.targetSwipeId === undefined
+      ) {
+        const tracked = getMessageStatesMap(chatId, userId)[messageId];
+        if (tracked) {
+          swipeId = tracked.swipeId;
+        }
+      }
     } else if (kind === "stopped" && !messageId) {
       if (!buffer?.targetMessageId) {
         return;
@@ -619,6 +733,7 @@ export function createBackend(spindle: SpindleAPI): BackendController {
         ? swipeId
         : 0;
     const key = makeMetaKey(messageId, safeSwipeId);
+    bumpChatMutationEpoch(chatId, userId);
     const meta = await store.loadChatMeta(chatId, userId);
     const existing = meta[key];
 
@@ -638,6 +753,7 @@ export function createBackend(spindle: SpindleAPI): BackendController {
       extractStopDetails(payload.stopDetails ?? payload.stop_details) ??
       existing?.stopDetails;
 
+    const hasBuffer = buffer !== undefined;
     const lorebookEntries = buffer?.lorebookEntries ?? [];
     const macroNames = buffer ? Array.from(buffer.macroNames) : [];
     const isImpersonate = payload.generationType === "impersonate";
@@ -669,10 +785,10 @@ export function createBackend(spindle: SpindleAPI): BackendController {
         : {}),
     };
 
-    if (lorebookEntries.length === 0) {
+    if (hasBuffer && lorebookEntries.length === 0) {
       delete record.lorebookTriggers;
     }
-    if (macroNames.length === 0) {
+    if (hasBuffer && macroNames.length === 0) {
       delete record.macrosApplied;
     }
 
@@ -683,16 +799,24 @@ export function createBackend(spindle: SpindleAPI): BackendController {
     setMessageState(chatId, messageId, { swipeId: safeSwipeId, isUser }, userId);
 
     if (generationId) {
+      const now = Date.now();
       recordCompletedRef(generationId, {
         chatId,
         messageId,
         swipeId: safeSwipeId,
-        startedAt: startedAt ?? Date.now(),
+        startedAt: startedAt ?? now,
+        completedAt: now,
       });
     }
 
     await store.saveChatMeta(chatId, meta, userId);
     pushChatMeta(chatId, meta, userId);
+
+    if (!hasBuffer || typeof content !== "string" || !finishReason) {
+      void hydrateChat(chatId, userId).then((hydrated) => {
+        pushChatMeta(chatId, hydrated, userId);
+      });
+    }
   }
 
   async function handleMetricsReady(rawPayload: unknown, userId?: string): Promise<void> {
@@ -720,6 +844,7 @@ export function createBackend(spindle: SpindleAPI): BackendController {
     const durationMs = extractDurationMs(payload.generationMetrics);
     if (durationMs === undefined) return;
 
+    bumpChatMutationEpoch(chatId, userId);
     const meta = await store.loadChatMeta(chatId, userId);
     const key = makeMetaKey(messageId, swipeId);
     let existing = meta[key];
@@ -741,13 +866,20 @@ export function createBackend(spindle: SpindleAPI): BackendController {
       durationMs,
     };
 
-    const states = getMessageStatesMap(chatId, userId);
-    if (!states[messageId]) {
-      states[messageId] = { swipeId, isUser };
+    if (completedRef && completedRef.swipeId !== swipeId) {
+      completedRef.swipeId = swipeId;
     }
+
+    setMessageState(chatId, messageId, { swipeId, isUser }, userId);
 
     await store.saveChatMeta(chatId, meta, userId);
     pushChatMeta(chatId, meta, userId);
+
+    if (!existing || existing.wordCount === undefined || !existing.finishReason) {
+      void hydrateChat(chatId, userId).then((hydrated) => {
+        pushChatMeta(chatId, hydrated, userId);
+      });
+    }
   }
 
   function registerMacroInterceptorIfPermitted(): void {
@@ -774,6 +906,7 @@ export function createBackend(spindle: SpindleAPI): BackendController {
       pruneStaleBuffers();
       const buffer = activeBuffersByChat.get(chatId);
       if (!buffer) return;
+      buffer.lastActivityAt = Date.now();
 
       const names = extractMacroNames(ctx.template);
       if (names.length === 0) return;
@@ -801,14 +934,16 @@ export function createBackend(spindle: SpindleAPI): BackendController {
     generationUnsubs.push(
       spindle.on("GENERATION_STARTED", (payload: GenerationStartedPayloadDTO) => {
         if (!payload?.chatId) return;
-        pruneStaleBuffers();
+        const now = Date.now();
+        pruneStaleBuffers(now);
         const raw = payload as GenerationStartedPayloadDTO & {
           targetSwipeId?: number;
         };
         const fresh: GenerationBuffer = {
           generationId: payload.generationId,
           chatId: payload.chatId,
-          startedAt: Date.now(),
+          startedAt: now,
+          lastActivityAt: now,
           targetMessageId:
             typeof payload.targetMessageId === "string"
               ? payload.targetMessageId
@@ -828,6 +963,41 @@ export function createBackend(spindle: SpindleAPI): BackendController {
         activeBuffersByChat.set(payload.chatId, fresh);
         if (payload.generationId) {
           activeBuffersByGenId.set(payload.generationId, fresh);
+        }
+      }),
+    );
+
+    generationUnsubs.push(
+      spindle.on("GENERATION_IN_PROGRESS", (rawPayload: unknown) => {
+        const payload = asRecord(rawPayload);
+        const chatId = typeof payload?.chatId === "string" ? payload.chatId : undefined;
+        if (!chatId) return;
+        const generationId =
+          typeof payload?.generationId === "string" ? payload.generationId : undefined;
+        const buffer = getOrCreateBuffer(chatId, generationId);
+        buffer.lastActivityAt = Date.now();
+        const targetMsgId =
+          typeof payload?.targetMessageId === "string" && payload.targetMessageId.length > 0
+            ? payload.targetMessageId
+            : typeof payload?.messageId === "string" && payload.messageId.length > 0
+              ? payload.messageId
+              : undefined;
+        if (targetMsgId && !buffer.targetMessageId) {
+          buffer.targetMessageId = targetMsgId;
+        }
+        const rawSwipeId =
+          typeof payload?.targetSwipeId === "number"
+            ? payload.targetSwipeId
+            : typeof payload?.swipeId === "number"
+              ? payload.swipeId
+              : undefined;
+        if (
+          typeof rawSwipeId === "number" &&
+          Number.isInteger(rawSwipeId) &&
+          rawSwipeId >= 0 &&
+          buffer.targetSwipeId === undefined
+        ) {
+          buffer.targetSwipeId = rawSwipeId;
         }
       }),
     );
@@ -863,10 +1033,12 @@ export function createBackend(spindle: SpindleAPI): BackendController {
 
       if (chatId) {
         const buffer = getOrCreateBuffer(chatId);
+        buffer.lastActivityAt = Date.now();
         buffer.lorebookEntries = entries;
       } else if (activeBuffersByChat.size === 1) {
         const only = activeBuffersByChat.values().next().value;
         if (only) {
+          only.lastActivityAt = Date.now();
           only.lorebookEntries = entries;
         }
       }
@@ -937,11 +1109,13 @@ export function createBackend(spindle: SpindleAPI): BackendController {
       if (!isUser) {
         const activeBuf = activeBuffersByChat.get(chatId);
         if (activeBuf) {
+          activeBuf.lastActivityAt = Date.now();
           activeBuf.streamedMessageIds.add(message.id);
         }
       }
 
       void (async () => {
+        bumpChatMutationEpoch(chatId, userId);
         const meta = await store.loadChatMeta(chatId, userId);
         const key = makeMetaKey(message.id!, swipeId);
         if (typeof message.content === "string") {
@@ -982,8 +1156,12 @@ export function createBackend(spindle: SpindleAPI): BackendController {
         activeBuf !== undefined &&
         (activeBuf.targetMessageId === message.id ||
           activeBuf.streamedMessageIds.has(message.id));
+      if (isGeneratingTarget && activeBuf) {
+        activeBuf.lastActivityAt = Date.now();
+      }
 
       void (async () => {
+        bumpChatMutationEpoch(chatId, userId);
         const meta = await store.loadChatMeta(chatId, userId);
         const key = makeMetaKey(message.id!, swipeId);
         const existing = meta[key];
@@ -1026,6 +1204,7 @@ export function createBackend(spindle: SpindleAPI): BackendController {
       if (!chatId || !messageId) return;
 
       void (async () => {
+        bumpChatMutationEpoch(chatId, userId);
         const meta = await store.loadChatMeta(chatId, userId);
         const contentMap = getLastKnownContentMap(chatId, userId);
         const prefix = `${messageId}:`;
@@ -1042,6 +1221,11 @@ export function createBackend(spindle: SpindleAPI): BackendController {
           }
         }
         deleteMessageState(chatId, messageId, userId);
+        for (const [genId, ref] of completedRefsByGenId.entries()) {
+          if (ref.chatId === chatId && ref.messageId === messageId) {
+            completedRefsByGenId.delete(genId);
+          }
+        }
         if (changed) {
           await store.saveChatMeta(chatId, meta, userId);
         }
@@ -1057,13 +1241,43 @@ export function createBackend(spindle: SpindleAPI): BackendController {
         if (!payload?.chatId || !payload.message?.id) return;
         const { chatId, message, action, swipeId } = payload;
 
+        const isUser =
+          typeof message.is_user === "boolean"
+            ? message.is_user
+            : (message as { role?: string }).role === "user";
+        const activeSwipeId =
+          typeof message.swipe_id === "number" && message.swipe_id >= 0
+            ? Math.floor(message.swipe_id)
+            : 0;
+        const targetSwipe =
+          action === "updated" && Number.isInteger(swipeId) && swipeId >= 0
+            ? swipeId
+            : activeSwipeId;
+
+        const activeBuf = activeBuffersByChat.get(chatId);
+        if (!isUser && activeBuf) {
+          activeBuf.lastActivityAt = Date.now();
+          if (action === "added") {
+            if (!activeBuf.targetMessageId) {
+              activeBuf.targetMessageId = message.id;
+            }
+            if (activeBuf.targetMessageId === message.id) {
+              activeBuf.targetSwipeId = activeSwipeId;
+            }
+          }
+        }
+        const isGeneratingTarget =
+          activeBuf !== undefined &&
+          (activeBuf.targetMessageId === message.id ||
+            activeBuf.streamedMessageIds.has(message.id) ||
+            (!isUser &&
+              typeof activeBuf.targetSwipeId === "number" &&
+              activeBuf.targetSwipeId === targetSwipe));
+
         void (async () => {
+          bumpChatMutationEpoch(chatId, userId);
           const meta = await store.loadChatMeta(chatId, userId);
           const contentMap = getLastKnownContentMap(chatId, userId);
-          const isUser =
-            typeof message.is_user === "boolean"
-              ? message.is_user
-              : (message as { role?: string }).role === "user";
           const extra = asRecord(message.extra);
 
           if (action === "deleted" && Number.isInteger(swipeId) && swipeId >= 0) {
@@ -1098,15 +1312,6 @@ export function createBackend(spindle: SpindleAPI): BackendController {
               contentMap.set(makeMetaKey(message.id, idx), val);
             }
           }
-
-          const activeSwipeId =
-            typeof message.swipe_id === "number" && message.swipe_id >= 0
-              ? Math.floor(message.swipe_id)
-              : 0;
-          const targetSwipe =
-            action === "updated" && Number.isInteger(swipeId) && swipeId >= 0
-              ? swipeId
-              : activeSwipeId;
 
           const swipeContent =
             Array.isArray(message.swipes) &&
@@ -1143,10 +1348,19 @@ export function createBackend(spindle: SpindleAPI): BackendController {
             outcome,
           });
 
+          const wasStagedBlank = !isUser && prevContent === "";
+          const recentlyGenerated = isRecentlyCompletedTarget(
+            chatId,
+            message.id,
+            targetSwipe,
+          );
           if (
             action === "updated" &&
+            !isGeneratingTarget &&
+            !wasStagedBlank &&
+            !recentlyGenerated &&
             typeof swipeContent === "string" &&
-            (prevContent === undefined || swipeContent !== prevContent)
+            (prevContent === undefined ? isUser : swipeContent !== prevContent)
           ) {
             meta[key].edited = true;
             meta[key].editedAt = Date.now();
@@ -1174,6 +1388,7 @@ export function createBackend(spindle: SpindleAPI): BackendController {
         const { chatId, message } = payload;
 
         void (async () => {
+          bumpChatMutationEpoch(chatId, userId);
           const meta = await store.loadChatMeta(chatId, userId);
           const contentMap = getLastKnownContentMap(chatId, userId);
           const isUser =
@@ -1352,6 +1567,7 @@ export function createBackend(spindle: SpindleAPI): BackendController {
       activeBuffersByGenId.clear();
       completedRefsByGenId.clear();
       hydrationInFlight.clear();
+      chatMutationEpoch.clear();
       activeChatIdByUser.clear();
       lastKnownContentByChat.clear();
       messageStatesByChat.clear();
